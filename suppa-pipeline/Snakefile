@@ -1,0 +1,148 @@
+import os
+
+configfile: os.path.join(workflow.basedir, "config.yaml")
+
+REL = config["release_root"]
+PYTHON = os.path.join(config["conda_prefix"], "bin", "python")
+# SUPPA lists event transcripts in set order, so an unpinned hash seed reorders them
+# between runs and moves PSI in the last float bits; pin it for byte-identical reruns.
+SUPPA = config["suppa"]
+SCRIPTS = os.path.join(workflow.basedir, "scripts")
+EVENTS = config["event_types"]
+FAMILY = {"SE": "SE", "A3": "SS", "A5": "SS", "MX": "MX", "RI": "RI", "AF": "FL", "AL": "FL"}
+FAMILIES = sorted({FAMILY[e] for e in EVENTS})
+
+
+def rel(*parts):
+    return os.path.join(REL, *parts)
+
+
+TPM = rel("expression", "isomiga_transcript_tpm.tsv")
+GTF = rel("reference", "isomiga_suppa.gtf")
+IOE = rel("events", "isomiga_{event}_strict.ioe")
+IOI = rel("events", "isomiga.ioi")
+LOCAL_PSI = rel("psi", "local", "isomiga_{event}.psi")
+ISOFORM_PSI = rel("psi", "isoform", "isomiga_isoform.psi")
+
+# Peak use in the 2026-08-28 run: PSI jobs 8-18 GB and <4 min, everything else <2 GB.
+localrules: all
+
+
+rule all:
+    input:
+        rel("SHA256SUMS.txt")
+
+
+rule build_inputs:
+    input:
+        manifest=config["sample_manifest"],
+        gtf=config["source_gtf"],
+        tx2gene=config["source_tx2gene"]
+    output:
+        tpm=TPM,
+        gtf=GTF,
+        id_map=rel("reference", "transcript_id_map.tsv"),
+        sample_audit=rel("qc", "quant_input_audit.tsv"),
+        annotation_audit=rel("qc", "annotation_transcript_audit.tsv"),
+        summary=rel("qc", "input_build_summary.tsv")
+    log: rel("logs", "build_inputs.log")
+    resources: mem_mb=4000, runtime=60
+    shell:
+        """
+        {PYTHON:q} {SCRIPTS}/build_inputs.py \
+          --manifest {input.manifest:q} --gtf {input.gtf:q} --tx2gene {input.tx2gene:q} \
+          --output-tpm {output.tpm:q} --output-gtf {output.gtf:q} --id-map {output.id_map:q} \
+          --sample-audit {output.sample_audit:q} --annotation-audit {output.annotation_audit:q} \
+          --summary {output.summary:q}
+        """
+
+
+rule generate_events:
+    input: GTF
+    output:
+        expand(IOE, event=EVENTS),
+        expand(rel("events", "isomiga_{event}_strict.gtf"), event=EVENTS)
+    params: prefix=rel("events", "isomiga")
+    log: rel("logs", "generate_events.log")
+    resources: mem_mb=8000, runtime=60
+    shell:
+        "PYTHONHASHSEED=0 {PYTHON:q} {SUPPA:q} generateEvents -i {input:q} -o {params.prefix:q}"
+        " -f ioe -e {FAMILIES} -b S -p"
+
+
+rule generate_ioi:
+    input: GTF
+    output: IOI
+    params: prefix=rel("events", "isomiga")
+    log: rel("logs", "generate_ioi.log")
+    resources: mem_mb=8000, runtime=60
+    shell:
+        "PYTHONHASHSEED=0 {PYTHON:q} {SUPPA:q} generateEvents -i {input:q} -o {params.prefix:q} -f ioi -p"
+
+
+rule psi_per_event:
+    input: ioe=IOE, tpm=TPM
+    output: LOCAL_PSI
+    params: prefix=lambda w: rel("psi", "local", f"isomiga_{w.event}")
+    log: rel("logs", "psi_per_event.{event}.log")
+    resources: mem_mb=32000, runtime=60
+    shell:
+        "PYTHONHASHSEED=0 {PYTHON:q} {SUPPA:q} psiPerEvent -i {input.ioe:q} -e {input.tpm:q} -o {params.prefix:q}"
+
+
+rule psi_per_isoform:
+    input: gtf=GTF, tpm=TPM
+    output: ISOFORM_PSI
+    params: prefix=rel("psi", "isoform", "isomiga")
+    log: rel("logs", "psi_per_isoform.log")
+    resources: mem_mb=32000, runtime=60
+    shell:
+        "PYTHONHASHSEED=0 {PYTHON:q} {SUPPA:q} psiPerIsoform -g {input.gtf:q} -e {input.tpm:q} -o {params.prefix:q}"
+
+
+rule validate_release:
+    input:
+        manifest=config["sample_manifest"],
+        tpm=TPM,
+        ioe=expand(IOE, event=EVENTS),
+        local_psi=expand(LOCAL_PSI, event=EVENTS),
+        ioi=IOI,
+        isoform_psi=ISOFORM_PSI
+    output:
+        event_counts=rel("qc", "event_counts.tsv"),
+        local_summary=rel("qc", "local_psi_summary.tsv"),
+        isoform_summary=rel("qc", "isoform_psi_summary.tsv"),
+        passed=rel("qc", "validation_passed.txt")
+    params: events=" ".join(EVENTS)
+    log: rel("logs", "validate_release.log")
+    resources: mem_mb=4000, runtime=60
+    shell:
+        """
+        {PYTHON:q} {SCRIPTS}/validate_release.py \
+          --manifest {input.manifest:q} --tpm {input.tpm:q} \
+          --events {params.events} --ioe {input.ioe:q} --local-psi {input.local_psi:q} \
+          --ioi {input.ioi:q} --isoform-psi {input.isoform_psi:q} \
+          --event-counts {output.event_counts:q} --local-summary {output.local_summary:q} \
+          --isoform-summary {output.isoform_summary:q} --passed {output.passed:q}
+        """
+
+
+# Methods doc plus checksums of every release file except logs; verify with
+# `cd <release> && sha256sum -c SHA256SUMS.txt`.
+rule publish:
+    input:
+        rules.validate_release.output,
+        methods=os.path.join(workflow.basedir, "docs", "SUPPA_DATA_METHODS.md")
+    output:
+        methods=rel("METHODS.md"),
+        sums=rel("SHA256SUMS.txt")
+    log: rel("logs", "publish.log")
+    resources: mem_mb=1000, runtime=60
+    shell:
+        """
+        cp {input.methods:q} {output.methods:q}
+        cd {REL:q}
+        find . -type f ! -path './logs/*' ! -name 'SHA256SUMS.txt*' -printf '%P\\0' \
+          | sort -z | xargs -0 sha256sum > SHA256SUMS.txt.tmp
+        mv SHA256SUMS.txt.tmp SHA256SUMS.txt
+        """

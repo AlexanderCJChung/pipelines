@@ -1,0 +1,32 @@
+# Two-sample dry-run configuration.
+
+input_dir: /sc/arion/projects/ad-omics/MiGA/MiGA_All/bams
+metadata: example/metadata.tsv
+qapa_input: bam
+
+output_dir: /sc/arion/projects/pd-omics/Mega_MyND/data/microglia/apa_smoke
+reference_dir: /sc/arion/projects/pd-omics/Mega_MyND/references/apa
+cohort: smoke
+
+reference_name: hg38
+references:
+  hg38:
+    qapa:
+      salmon_index: /sc/arion/projects/pd-omics/Mega_MyND/references/apa/hg38/qapa/salmon_index
+      identifiers: /sc/arion/projects/pd-omics/Mega_MyND/references/apa/hg38/qapa/ensembl_identifiers.tsv
+    apalyzer:
+      rdata: /sc/arion/projects/pd-omics/Mega_MyND/references/apa/hg38/apalyzer/hg38_REF.RData
+
+salmon_library_type: "A"
+apalyzer_strand_type: "NONE"
+apalyzer_seq_type: "ThreeMostPairEnd"
+
+tools:
+  run_qapa: true
+  run_apalyzer: true
+
+software:
+  salmon: /sc/arion/projects/ad-omics/data/software/salmon-1.9.0_linux_x86_64/bin/salmon
+  qapa_env: /sc/arion/projects/pd-omics/alex/conda/qapa
+
+threads: 16

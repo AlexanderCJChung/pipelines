@@ -1,0 +1,6 @@
+.snakemake/
+logs/
+vendor/SUPPA/
+*.pyc
+__pycache__/
+

@@ -1,0 +1,54 @@
+# APA pipeline configuration
+
+# Inputs
+input_dir: /sc/arion/projects/pd-omics/MiGA_isomiga_v38_annotation/rapid
+metadata: metadata.tsv
+qapa_input: fastq  # bam or fastq; FASTQs are the cohort originals in scratch
+
+# Outputs
+output_dir: /sc/arion/projects/pd-omics/Mega_MyND/data/microglia/apa
+reference_dir: /sc/arion/projects/pd-omics/Mega_MyND/references/apa
+cohort: miga
+
+# Select one entry from references. Both entries are GRCh38; they differ in
+# the transcript models that define the QAPA 3' UTR library.
+reference_name: isomiga
+# APAlyzer uses the official PolyA_DB reference: its output is gene-level, and
+# PAS2GEF's annotated-end sites leave ~30% fewer genes with a finite 3' UTR RE
+# (references/README.md). Omit to use reference_name.
+apalyzer_reference_name: hg38
+references:
+  # isoMiGA v38: GENCODE v38 plus microglia PacBio transcripts. Matches the
+  # annotation used for transcript-level quantification of this cohort.
+  # Built by scripts/build_qapa_utr_library.sh from isomiga_gencode.gtf.
+  isomiga:
+    qapa:
+      salmon_index: /sc/arion/projects/pd-omics/Mega_MyND/references/apa/isomiga/qapa/salmon_index
+      identifiers: /sc/arion/projects/pd-omics/Mega_MyND/references/apa/isomiga/qapa/ensembl_identifiers.tsv
+    apalyzer:
+      # Built by PAS2GEF from the isoMiGA GTF (scripts/prepare_apalyzer_gtf.sh).
+      gtf: /sc/arion/projects/pd-omics/Mega_MyND/references/apa/isomiga/apalyzer/isomiga_gencode.pas2gef.gtf.gz
+  # QAPA's precompiled GENCODE V31 library. Comparable to published QAPA results.
+  hg38:
+    qapa:
+      salmon_index: /sc/arion/projects/pd-omics/Mega_MyND/references/apa/hg38/qapa/salmon_index
+      identifiers: /sc/arion/projects/pd-omics/Mega_MyND/references/apa/hg38/qapa/ensembl_identifiers.tsv
+    apalyzer:
+      # Official APAlyzer hg38 reference (PolyA_DB v3 poly(A) sites).
+      rdata: /sc/arion/projects/pd-omics/Mega_MyND/references/apa/hg38/apalyzer/hg38_REF.RData
+
+# Library settings
+salmon_library_type: "A"
+apalyzer_strand_type: "NONE"  # forward, invert, or NONE
+apalyzer_seq_type: "ThreeMostPairEnd"  # SingleEnd or ThreeMostPairEnd
+
+tools:
+  run_qapa: true
+  run_apalyzer: true
+
+software:
+  salmon: /sc/arion/projects/ad-omics/data/software/salmon-1.9.0_linux_x86_64/bin/salmon
+  qapa_env: /sc/arion/projects/pd-omics/alex/conda/qapa
+
+# Must match the core count for sample rules in cluster.yaml.
+threads: 16

@@ -1,0 +1,9 @@
+sample_manifest: /sc/arion/projects/pd-omics/MiGA_isomiga_v38_annotation/sample_manifest.tsv
+release_root: /sc/arion/projects/pd-omics/MiGA_isomiga_v38_annotation/suppa/2026-09-28_suppa_v2.4
+source_gtf: /sc/arion/projects/pd-omics/MiGA_isomiga_v38_annotation/references/isomiga_gencode.gtf
+source_tx2gene: /sc/arion/projects/pd-omics/MiGA_isomiga_v38_annotation/references/tx2gene.isomiga.tsv
+conda_prefix: /sc/arion/projects/pd-omics/alex/conda/suppa2.4
+suppa: /sc/arion/projects/pd-omics/alex/pipelines/suppa-pipeline/vendor/SUPPA/suppa.py
+# SUPPA local event classes. generateEvents takes families (SS = A3+A5, FL = AF+AL);
+# the Snakefile derives them from this list.
+event_types: [SE, A3, A5, MX, RI, AF, AL]

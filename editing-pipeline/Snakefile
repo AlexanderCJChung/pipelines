@@ -1,0 +1,419 @@
+## RNA editing pipeline. Ported from RajLabMSSM/editing-pipeline (Jack Humphrey,
+## Winston Cuddleston, Flora Hyomin Seo, Raj Lab); every change from upstream is marked
+## DIVERGENCE here or in a script header and listed in docs/EDITING_DATA_METHODS.md.
+##
+## Arms, gated by config['tools']:
+##   JACUSA     site-level A>I: de novo + REDIportal discovery -> cohort filter ->
+##              ANNOVAR -> pileup back-fill of every sample at the surviving sites
+##   AEI        Alu Editing Index, one global A>I rate per sample
+##   REDItools  exploratory per-sample second opinion; off by default, no cohort merge
+##
+## jacusa2, rnaeditingindexer and reditools are CentOS-7 modules. reditools loads a
+## python 2.7 whose hashlib is broken on Rocky 9 and repopulates PYTHONPATH, so its
+## rules `unset PYTHONPATH` after `ml`.
+
+import os
+import pandas as pd
+
+configfile: os.path.join(workflow.basedir, "config.yaml")
+
+REL = config["release_root"]
+SCRIPTS = os.path.join(workflow.basedir, "scripts")
+R = "ml " + config["r_module"] + "; Rscript " + SCRIPTS
+CHROMS = config["chroms"]
+TOOLS = config["tools"]
+LIB = config["library"]              # JACUSA -P; also decides AEI --stranded
+AEI_CONTIG = config["aei_contig"]
+
+
+def rel(*parts):
+    return os.path.join(REL, *parts)
+
+
+def sdir(tool):
+    return rel("samples", "{sample}", tool, "{sample}")
+
+
+manifest = pd.read_csv(config["sample_manifest"], sep="\t", dtype=str)
+manifest = manifest[manifest["in_study"] == "yes"]
+SAMPLES = list(manifest["sample_id"])
+BAM = dict(zip(manifest["sample_id"], manifest["bam"]))
+
+SAMPLE_SHEET = rel("qc", "samples.tsv")
+MATRIX = rel("matrices", "isomiga_pileup_{kind}.tsv.gz")
+AEI = rel("matrices", "isomiga_aei.tsv")
+JACUSA_JAR = "ml " + config["jacusa_module"] + "; java -jar $JACUSA2_JAR call-1"
+ANNOVAR = ("ml annovar; table_annovar.pl {input} " + config["humandb"] + " -buildver hg38"
+           " -out {params.prefix} -remove -protocol " + config["annovar_protocols"] +
+           " -operation " + config["annovar_operations"] + " -arg " + config["annovar_args"] +
+           " -nastring '.' --otherinfo --thread {threads} --maxGeneThread {threads}")
+
+wildcard_constraints:
+    sample = "[A-Za-z0-9_.-]+",
+    chrom = "[A-Za-z0-9_]+",
+    kind = "[a-z]+"
+
+localrules: all, sample_sheet
+
+# Resources are per job (rusage[mem] is per job on Minerva). Peaks from the 2026-08-20
+# 521-sample run: JACUSA calls 12 GB / 34 min, ANNOVAR 20 GB / 71 min, AEI 11 GB,
+# cohort R jobs <= 9 GB, everything else < 3.5 GB.
+
+
+def targets():
+    if not (TOOLS["run_jacusa"] or TOOLS["run_aei"] or TOOLS["run_reditools"]):
+        raise ValueError("every arm in config['tools'] is false - nothing to do")
+    out = [rel("SHA256SUMS.txt")]
+    if TOOLS["run_reditools"]:
+        out += expand(sdir("reditools") + ".reditools.hg38_multianno.txt", sample=SAMPLES)
+    return out
+
+
+rule all:
+    input: targets()
+
+
+# The R merge/filter scripts read the sample list and column order from a `sample`
+# column. No `group` column, so filter_cohort.R treats the cohort as one group.
+rule sample_sheet:
+    input: config["sample_manifest"]
+    output: SAMPLE_SHEET
+    run:
+        pd.DataFrame({"sample": SAMPLES}).to_csv(output[0], sep="\t", index=False)
+
+# =============================================================== ARM A - JACUSA ===
+
+# De novo calling genome-wide.
+#   -a D,M,Y,E  indel/read-end/splice-site, max 2 alleles, homopolymer, ENCODE blacklist
+#   -F          DIVERGENCE: 3844 (unmapped+QC-fail+dup+secondary+supplementary), not
+#               upstream's 1024; the STAR BAMs keep secondary alignments.
+#   -s          writes a .filtered sidecar we do not use; removed with rm -f.
+rule jacusa_denovo:
+    input:
+        blacklist = config["blacklist_bed"],
+        fasta = config["genome_fasta"]
+    output: sdir("jacusa") + ".out"
+    params: bam = lambda w: BAM[w.sample]
+    log: rel("logs", "jacusa_denovo", "{sample}.log")
+    threads: 8
+    resources: mem_mb=16000, runtime=90
+    shell:
+        "{JACUSA_JAR} -r {output} {params.bam} -p {threads} "
+        "-a D,M,Y,E:file={input.blacklist}:type=BED "
+        "-s -m {config[min_mapq]} -q {config[min_basq]} -R {input.fasta} -P {LIB} "
+        "-F {config[flag_filter]}; "
+        "rm -f {output}.filtered"
+
+# Supervised calling at REDIportal sites (-A reports sites without variants). The lower
+# depth threshold downstream recovers known editing that de novo filtering misses.
+rule jacusa_known:
+    input: bed = config["redi_sites_bed"]
+    output: sdir("jacusa") + ".knownES.out"
+    params: bam = lambda w: BAM[w.sample]
+    log: rel("logs", "jacusa_known", "{sample}.log")
+    threads: 8
+    resources: mem_mb=16000, runtime=90
+    shell:
+        "{JACUSA_JAR} -r {output} -b {input.bed} {params.bam} -p {threads} -a D,Y "
+        "-P {LIB} -F {config[flag_filter]} -A -s -m {config[min_mapq]} -q {config[min_basq]}; "
+        "rm -f {output}.filtered"
+
+# DIVERGENCE: one parse script for both passes (upstream had two near-identical copies).
+rule parse_denovo:
+    input: sdir("jacusa") + ".out"
+    output: sdir("jacusa") + ".filt"
+    log: rel("logs", "parse_denovo", "{sample}.log")
+    resources: mem_mb=6000, runtime=30
+    shell:
+        "{R}/parse_jacusa.R --input {input} --output {output} "
+        "--siteDepth {config[denovo_site_depth]} --altDepth {config[alt_depth]} "
+        "--minRate {config[min_edit_rate_site]} --multiallelic {config[multiallelic]} --threads {threads}"
+
+rule parse_known:
+    input: sdir("jacusa") + ".knownES.out"
+    output: sdir("jacusa") + ".knownES.filt"
+    log: rel("logs", "parse_known", "{sample}.log")
+    resources: mem_mb=2000, runtime=30
+    shell:
+        "{R}/parse_jacusa.R --input {input} --output {output} "
+        "--siteDepth {config[known_site_depth]} --altDepth {config[alt_depth]} "
+        "--minRate {config[min_edit_rate_site]} --multiallelic {config[multiallelic]} --threads {threads}"
+
+rule cat_all_sites:
+    input:
+        denovo = sdir("jacusa") + ".filt",
+        known = sdir("jacusa") + ".knownES.filt"
+    output: sdir("jacusa") + ".filtAll"
+    log: rel("logs", "cat_all_sites", "{sample}.log")
+    resources: mem_mb=2000, runtime=30
+    shell:
+        "{R}/concatenate_sites.R --deNovoIN {input.denovo} --knownIN {input.known} --output {output}"
+
+# One job per chromosome; column order comes from the sample sheet.
+rule merge_jacusa:
+    input:
+        sheet = SAMPLE_SHEET,
+        sites = expand(rel("samples", "{sample}", "jacusa", "{sample}.filtAll"), sample=SAMPLES)
+    output:
+        cov = rel("cohort", "merge", "{chrom}_coverage.tsv.gz"),
+        rat = rel("cohort", "merge", "{chrom}_ratio.tsv.gz")
+    log: rel("logs", "merge_jacusa", "{chrom}.log")
+    threads: 4
+    resources: mem_mb=12000, runtime=60
+    shell:
+        "{R}/merge_jacusa.R --inDir {REL}/samples --subDir jacusa --metadata {input.sheet} "
+        "--chr {wildcards.chrom} --outCov {output.cov} --outRat {output.rat} "
+        "--minSamples {config[merge_min_samples]} --threads {threads}"
+
+rule filter_cohort:
+    input:
+        sheet = SAMPLE_SHEET,
+        cov = rel("cohort", "merge", "{chrom}_coverage.tsv.gz"),
+        rat = rel("cohort", "merge", "{chrom}_ratio.tsv.gz")
+    output:
+        cov = rel("cohort", "filter", "{chrom}_coverage.tsv.gz"),
+        rat = rel("cohort", "filter", "{chrom}_ratio.tsv.gz")
+    log: rel("logs", "filter_cohort", "{chrom}.log")
+    threads: 4
+    resources: mem_mb=16000, runtime=30
+    shell:
+        "{R}/filter_cohort.R --inCov {input.cov} --inRat {input.rat} "
+        "--outCov {output.cov} --outRat {output.rat} --metadata {input.sheet} "
+        "--minSamples {config[min_coverage]} --minER {config[min_edit_rate]} --threads {threads}"
+
+rule concatenate_cohort:
+    input:
+        cov = expand(rel("cohort", "filter", "{chrom}_coverage.tsv.gz"), chrom=CHROMS),
+        rat = expand(rel("cohort", "filter", "{chrom}_ratio.tsv.gz"), chrom=CHROMS)
+    output:
+        cov = rel("cohort", "all_sites_coverage.tsv.gz"),
+        rat = rel("cohort", "all_sites_ratio.tsv.gz"),
+        av = rel("cohort", "avinput.txt")
+    params: chroms = ",".join(CHROMS)
+    log: rel("logs", "concatenate_cohort.log")
+    threads: 4
+    resources: mem_mb=10000, runtime=60
+    shell:
+        "{R}/concatenate_cohort.R --inDir {REL}/cohort/filter --chroms {params.chroms} "
+        "--outCov {output.cov} --outRat {output.rat} --outAvinput {output.av} --threads {threads}"
+
+# gnomad30_genome is a 43 GB flat file scanned linearly, so this takes ~1 h at any size.
+rule annovar:
+    input: rel("cohort", "avinput.txt")
+    output: rel("cohort", "myanno.hg38_multianno.txt")
+    params: prefix = rel("cohort", "myanno")
+    log: rel("logs", "annovar.log")
+    threads: 8
+    resources: mem_mb=32000, runtime=180
+    shell: ANNOVAR
+
+rule filter_annovar:
+    input:
+        anno = rel("cohort", "myanno.hg38_multianno.txt"),
+        gencode = config["gencode_gene_strand"]
+    output:
+        anno = rel("cohort", "editing_annotation.txt"),
+        bed = rel("cohort", "editing_sites.bed")
+    log: rel("logs", "filter_annovar.log")
+    resources: mem_mb=2000, runtime=30
+    shell:
+        "{R}/filter_annovar.R --inAnno {input.anno} --gencode {input.gencode} "
+        "--outAnno {output.anno} --outBed {output.bed} "
+        "--maxGnomadAF {config[max_gnomad_af]} --threads {threads}"
+
+# Back-fill. DIVERGENCE: -c 1 (upstream kept JACUSA's -c 5), so every covered locus is
+# reported and merge_pileup.R applies the depth cut; NA then means only "too shallow".
+rule jacusa_pileup:
+    input: bed = rel("cohort", "editing_sites.bed")
+    output: sdir("jacusa") + ".pileup.txt"
+    params: bam = lambda w: BAM[w.sample]
+    log: rel("logs", "jacusa_pileup", "{sample}.log")
+    threads: 8
+    resources: mem_mb=16000, runtime=60
+    shell:
+        "{JACUSA_JAR} -r {output} -b {input.bed} {params.bam} -p {threads} -a D,Y "
+        "-P {LIB} -F {config[flag_filter]} -A -s -c 1 -m {config[min_mapq]} -q {config[min_basq]}; "
+        "rm -f {output}.filtered"
+
+rule parse_pileup:
+    input: sdir("jacusa") + ".pileup.txt"
+    output: sdir("jacusa") + ".pileup.parsed.txt"
+    log: rel("logs", "parse_pileup", "{sample}.log")
+    resources: mem_mb=2000, runtime=30
+    shell:
+        "{R}/parse_pileup.R --input {input} --output {output} --threads {threads}"
+
+rule merge_pileup:
+    input:
+        sheet = SAMPLE_SHEET,
+        parsed = expand(rel("samples", "{sample}", "jacusa", "{sample}.pileup.parsed.txt"), sample=SAMPLES),
+        anno = rel("cohort", "editing_annotation.txt")
+    output:
+        cov = MATRIX.format(kind="coverage"),
+        rat = MATRIX.format(kind="editing"),
+        anno = MATRIX.format(kind="annotation"),
+        dtu = MATRIX.format(kind="dtu")
+    log: rel("logs", "merge_pileup.log")
+    threads: 4
+    resources: mem_mb=10000, runtime=60
+    shell:
+        "{R}/merge_pileup.R --inDir {REL}/samples --subDir jacusa --metadata {input.sheet} "
+        "--anno {input.anno} --outCov {output.cov} --outRat {output.rat} --outAnno {output.anno} "
+        "--outDtu {output.dtu} --minCov {config[pileup_min_cov]} "
+        "--missing_sites {config[site_missingness]} --missing_samples {config[sample_missingness]} "
+        "--threads {threads}"
+
+# ================================================================== ARM B - AEI ===
+
+# The index is a genome-wide Alu average, so one contig is enough and keeps it cheap.
+# The subset BAM is scratch for RNAEditingIndex only (~330 MB per sample), hence temp().
+rule aei_subset_bam:
+    output:
+        bam = temp(sdir("aei") + "." + AEI_CONTIG + ".bam"),
+        bai = temp(sdir("aei") + "." + AEI_CONTIG + ".bam.bai")
+    params: bam = lambda w: BAM[w.sample]
+    log: rel("logs", "aei_subset_bam", "{sample}.log")
+    threads: 4
+    resources: mem_mb=2000, runtime=30
+    shell:
+        "ml samtools/1.17; set -o pipefail; "
+        "samtools view -@ {threads} -bh {params.bam} {AEI_CONTIG} > {output.bam}; "
+        "samtools index -@ {threads} {output.bam}"
+
+rule aei:
+    input:
+        bam = sdir("aei") + "." + AEI_CONTIG + ".bam",
+        bai = sdir("aei") + "." + AEI_CONTIG + ".bam.bai",
+        genes_expression = config["aei_ref_dir"] + "/GenesExpression/HomoSapiens/ucscHg38GTExGeneExpression.bed.gz",
+        refseq = config["aei_ref_dir"] + "/RefSeqAnnotations/HomoSapiens/ucscHg38RefSeqCurated.bed.gz",
+        snps = config["aei_ref_dir"] + "/SNPs/HomoSapiens/ucscHg38CommonGenomicSNPs150.bed.gz",
+        gf = config["aei_ref_dir"] + "/Genomes/HomoSapiens/ucscHg38Genome.fa",
+        rb = config["aei_ref_dir"] + "/Regions/HomoSapiens/ucscHg38Alu.bed.gz"
+    output: rel("samples", "{sample}", "aei", "EditingIndex.csv")
+    params:
+        # RNAEditingIndex needs an absolute directory for -d/-o and writes relative to it.
+        dir = lambda w: os.path.abspath(rel("samples", w.sample, "aei")),
+        suffix = "." + AEI_CONTIG + ".bam",
+        stranded = "" if LIB.upper() == "UNSTRANDED" else "--stranded",
+        paired = "--paired" if config["paired"] else ""
+    log: rel("logs", "aei", "{sample}.log")
+    threads: 4
+    resources: mem_mb=16000, runtime=30
+    shell:
+        "ml rnaeditingindexer; ml samtools/1.17; "
+        # RNAEditingIndex refuses to start if a stale flags directory is present.
+        "rm -rf {params.dir}/flags; cd {params.dir}; "
+        "RNAEditingIndex -d {params.dir} -f {params.suffix} -o {params.dir} "
+        "--log_path {params.dir} --genes_expression {input.genes_expression} "
+        "--refseq {input.refseq} --snps {input.snps} -gf {input.gf} -rb {input.rb} "
+        "--genome UserProvided {params.paired} {params.stranded}"
+
+# DIVERGENCE: upstream shipped merge_AEI.R but no rule called it.
+rule merge_aei:
+    input: expand(rel("samples", "{sample}", "aei", "EditingIndex.csv"), sample=SAMPLES)
+    output: AEI
+    log: rel("logs", "merge_aei.log")
+    resources: mem_mb=2000, runtime=30
+    shell:
+        "{R}/merge_AEI.R --inFolder {REL}/samples --output {output}"
+
+# ======================================================================= RELEASE ===
+
+JACUSA_OUT = [MATRIX.format(kind=k) for k in ("editing", "coverage", "annotation", "dtu")]
+
+rule validate_release:
+    input:
+        sheet = SAMPLE_SHEET,
+        jacusa = JACUSA_OUT if TOOLS["run_jacusa"] else [],
+        aei = AEI if TOOLS["run_aei"] else []
+    output:
+        summary = rel("qc", "release_summary.tsv"),
+        spectrum = rel("qc", "substitution_spectrum.tsv"),
+        passed = rel("qc", "validation_passed.txt")
+    params:
+        editing = MATRIX.format(kind="editing") if TOOLS["run_jacusa"] else "",
+        annotation = MATRIX.format(kind="annotation") if TOOLS["run_jacusa"] else "",
+        aei = AEI if TOOLS["run_aei"] else ""
+    log: rel("logs", "validate_release.log")
+    resources: mem_mb=4000, runtime=30
+    shell:
+        "{R}/validate_release.R --samples {input.sheet} --editing '{params.editing}' "
+        "--annotation '{params.annotation}' --aei '{params.aei}' --minAG {config[min_ag_fraction]} "
+        "--summary {output.summary} --spectrum {output.spectrum} --passed {output.passed}"
+
+# Methods doc plus checksums of the release minus per-sample intermediates and logs;
+# verify with `cd <release> && sha256sum -c SHA256SUMS.txt`.
+rule publish:
+    input:
+        rules.validate_release.output,
+        methods = os.path.join(workflow.basedir, "docs", "EDITING_DATA_METHODS.md")
+    output:
+        methods = rel("METHODS.md"),
+        sums = rel("SHA256SUMS.txt")
+    log: rel("logs", "publish.log")
+    resources: mem_mb=1000, runtime=30
+    shell:
+        """
+        cp {input.methods:q} {output.methods:q}
+        cd {REL:q}
+        find . -type f ! -path './logs/*' ! -path './samples/*' ! -name 'SHA256SUMS.txt*' -printf '%P\\0' \
+          | sort -z | xargs -0 sha256sum > SHA256SUMS.txt.tmp
+        mv SHA256SUMS.txt.tmp SHA256SUMS.txt
+        """
+
+# ============================================================ ARM C - REDItools ===
+# Exploratory: no cohort merge. Unchanged from the 2026-08-04 port apart from paths.
+
+# DIVERGENCE: temp dirs go to node-local scratch keyed on job id and sample (upstream
+# used the submission CWD, so concurrent samples collided).
+rule reditools:
+    output: sdir("reditools") + ".rediout.gz"
+    params: bam = lambda w: BAM[w.sample]
+    log: rel("logs", "reditools", "{sample}.log")
+    threads: 8
+    resources: mem_mb=64000, runtime=1440, queue="premium"
+    shell:
+        "ml reditools; unset PYTHONPATH; set -euo pipefail; "
+        "TMPROOT=${{TMPDIR:-/tmp}}/reditools_${{LSB_JOBID:-local}}_{wildcards.sample}; "
+        "rm -rf $TMPROOT; mkdir -p $TMPROOT/cov $TMPROOT/results; "
+        "{config[reditools_dir]}/extract_coverage_dynamic.sh {params.bam} $TMPROOT/cov/ {config[reditools_fai]}; "
+        # The OFI/libfabric transport is absent on these nodes; force TCP.
+        "mpirun --mca btl tcp,self -np {threads} "
+        "{config[reditools_dir]}/src/cineca/parallel_reditools.py -f {params.bam} "
+        "-r {config[reditools_ref]} -S -s {config[reditools_strand]} -ss 5 -mrl 50 -q 10 -bq 20 "
+        "-C -T 2 -c -m {config[reditools_homopolymer]} -os 5 -t $TMPROOT/results/ "
+        "-Z {config[reditools_fai]} -G $TMPROOT/cov/*.cov -D $TMPROOT/cov/ "
+        "-o {wildcards.sample}_out; "
+        "ml htslib/1.7; "
+        "{config[reditools_dir]}/merge.sh $TMPROOT/results {output} {threads}; "
+        "rm -rf $TMPROOT"
+
+# DIVERGENCE: upstream referenced renamed scripts and had a stray brace; it never ran.
+rule reditools_filter:
+    input: sdir("reditools") + ".rediout.gz"
+    output: sdir("reditools") + ".reditools.filtered.avinput"
+    params: prefix = sdir("reditools")
+    log: rel("logs", "reditools_filter", "{sample}.log")
+    resources: mem_mb=8000, runtime=180
+    shell:
+        "set -euo pipefail; "
+        "sh {SCRIPTS}/reditools_filter_strand.awk {input} {params.prefix}_annovar.input; "
+        "ml reditools; unset PYTHONPATH; "
+        # python 2 script; 2>/dev/null hides the Rocky 9 hashlib noise, pipefail still
+        # catches a real failure.
+        "python {SCRIPTS}/reditools_filter_depth.py {params.prefix}_annovar.input "
+        "{config[reditools_change_dp]} {config[reditools_locus_dp]} 2>/dev/null "
+        "> {params.prefix}_annovar_filtered.input; "
+        "ml bedtools; "
+        "bedtools intersect -v -a {params.prefix}_annovar_filtered.input "
+        "-b {config[reditools_dbsnp_bed]} > {output}"
+
+# DIVERGENCE: upstream left this rule commented out.
+rule reditools_annovar:
+    input: sdir("reditools") + ".reditools.filtered.avinput"
+    output: sdir("reditools") + ".reditools.hg38_multianno.txt"
+    params: prefix = sdir("reditools") + ".reditools"
+    log: rel("logs", "reditools_annovar", "{sample}.log")
+    threads: 4
+    resources: mem_mb=16000, runtime=360
+    shell: ANNOVAR

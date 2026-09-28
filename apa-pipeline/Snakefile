@@ -1,0 +1,366 @@
+"""Quantify APA events with QAPA and APAlyzer."""
+
+import csv
+import os
+import re
+import shlex
+import shutil
+import tempfile
+
+# Configuration -------------------------------------------------------------
+input_dir = config["input_dir"]
+output_dir = config["output_dir"]
+reference_dir = config["reference_dir"]
+metadata_file = config["metadata"]
+cohort = config["cohort"]
+reference_name = config["reference_name"]
+# APAlyzer may use a different reference set than QAPA.
+apalyzer_reference_name = config.get("apalyzer_reference_name", reference_name)
+qapa_input = config["qapa_input"]
+
+salmon_library_type = config["salmon_library_type"]
+apalyzer_strand_type = config["apalyzer_strand_type"]
+apalyzer_seq_type = config["apalyzer_seq_type"]
+threads = config["threads"]
+
+salmon = config["software"]["salmon"]
+qapa_env = config["software"]["qapa_env"]
+qapa = os.path.join(qapa_env, "bin", "qapa")
+
+tool_config = config["tools"]
+for tool_name in ("run_qapa", "run_apalyzer"):
+    if not isinstance(tool_config.get(tool_name), bool):
+        raise WorkflowError("tools.%s must be true or false" % tool_name)
+
+run_qapa = tool_config["run_qapa"]
+run_apalyzer = tool_config["run_apalyzer"]
+if not run_qapa and not run_apalyzer:
+    raise WorkflowError("no tools are enabled")
+
+if qapa_input not in {"bam", "fastq"}:
+    raise WorkflowError("qapa_input must be bam or fastq")
+if apalyzer_strand_type not in {"forward", "invert", "NONE"}:
+    raise WorkflowError("apalyzer_strand_type must be forward, invert, or NONE")
+if apalyzer_seq_type not in {"SingleEnd", "ThreeMostPairEnd"}:
+    raise WorkflowError("apalyzer_seq_type must be SingleEnd or ThreeMostPairEnd")
+if not isinstance(threads, int) or threads < 4:
+    raise WorkflowError("threads must be an integer of at least 4")
+
+safe_name = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+for label, value in (
+    ("cohort", cohort),
+    ("reference_name", reference_name),
+    ("apalyzer_reference_name", apalyzer_reference_name),
+):
+    if not isinstance(value, str) or not safe_name.fullmatch(value):
+        raise WorkflowError(
+            "%s may contain only letters, numbers, dots, underscores, and hyphens"
+            % label
+        )
+
+reference_sets = config.get("references", {})
+if reference_name not in reference_sets:
+    raise WorkflowError(
+        "reference_name '%s' is not defined under references" % reference_name
+    )
+if apalyzer_reference_name not in reference_sets:
+    raise WorkflowError(
+        "apalyzer_reference_name '%s' is not defined under references"
+        % apalyzer_reference_name
+    )
+selected_reference = reference_sets[reference_name]
+
+qapa_reference = selected_reference.get("qapa", {})
+apalyzer_reference_config = reference_sets[apalyzer_reference_name].get(
+    "apalyzer", {}
+)
+qapa_index = qapa_reference.get("salmon_index", "/disabled/qapa_index")
+qapa_identifiers = qapa_reference.get("identifiers", "/disabled/qapa_identifiers")
+# APAlyzer builds from an official RData reference or from a GTF (PAS2GEF).
+apalyzer_source = apalyzer_reference_config.get(
+    "gtf",
+    apalyzer_reference_config.get("rdata", "/disabled/apalyzer_reference.RData"),
+)
+
+if run_qapa and (
+    "salmon_index" not in qapa_reference or "identifiers" not in qapa_reference
+):
+    raise WorkflowError(
+        "references.%s.qapa requires salmon_index and identifiers" % reference_name
+    )
+if run_apalyzer and not (
+    "rdata" in apalyzer_reference_config or "gtf" in apalyzer_reference_config
+):
+    raise WorkflowError(
+        "references.%s.apalyzer requires rdata or gtf" % apalyzer_reference_name
+    )
+
+
+# Samples -------------------------------------------------------------------
+with open(metadata_file, newline="") as handle:
+    reader = csv.DictReader(handle, delimiter="\t")
+    metadata_columns = set(reader.fieldnames or [])
+    metadata_rows = list(reader)
+
+required_columns = {"sample"}
+if run_apalyzer or (run_qapa and qapa_input == "bam"):
+    required_columns.add("BAM")
+if run_qapa and qapa_input == "fastq":
+    required_columns.update({"R1", "R2"})
+
+missing_columns = sorted(required_columns - metadata_columns)
+if missing_columns:
+    raise WorkflowError(
+        "%s is missing: %s" % (metadata_file, ", ".join(missing_columns))
+    )
+if not metadata_rows:
+    raise WorkflowError("metadata has no samples")
+
+samples = [row["sample"].strip() for row in metadata_rows]
+if any(not sample for sample in samples):
+    raise WorkflowError("metadata contains an empty sample ID")
+duplicates = sorted({sample for sample in samples if samples.count(sample) > 1})
+if duplicates:
+    raise WorkflowError("duplicate sample IDs: %s" % ", ".join(sorted(duplicates)))
+
+invalid_samples = sorted(
+    sample for sample in samples if not safe_name.fullmatch(sample)
+)
+if invalid_samples:
+    raise WorkflowError("invalid sample IDs: %s" % ", ".join(invalid_samples[:5]))
+
+for column in required_columns - {"sample"}:
+    if any(not (row.get(column) or "").strip() for row in metadata_rows):
+        raise WorkflowError("metadata column '%s' contains an empty path" % column)
+
+sample_data = {row["sample"].strip(): row for row in metadata_rows}
+
+
+def input_path(sample, column):
+    """Return an absolute input path from the sample sheet."""
+    path = sample_data[sample][column]
+    return path if os.path.isabs(path) else os.path.join(input_dir, path)
+
+
+def qapa_read_paths(wildcards):
+    """Return a BAM or paired FASTQs for QAPA."""
+    if qapa_input == "bam":
+        return [input_path(wildcards.sample, "BAM")]
+    return [
+        input_path(wildcards.sample, "R1"),
+        input_path(wildcards.sample, "R2"),
+    ]
+
+
+# Paths ---------------------------------------------------------------------
+events_dir = os.path.join(output_dir, "events")
+apalyzer_reference = os.path.join(
+    reference_dir, "apalyzer", apalyzer_reference_name, "prepared_reference.RData"
+)
+
+
+qapa_quant_pattern = os.path.join(
+    output_dir, "{sample}", reference_name, "qapa_salmon", "quant.sf"
+)
+apalyzer_utr_pattern = os.path.join(
+    output_dir, "{sample}", apalyzer_reference_name, "apalyzer", "3utr.tsv"
+)
+apalyzer_ipa_pattern = os.path.join(
+    output_dir, "{sample}", apalyzer_reference_name, "apalyzer", "ipa.tsv"
+)
+
+
+# Event tables carry the reference name so runs on different references coexist.
+qapa_events = os.path.join(
+    events_dir, "%s_%s_qapa_events.tsv" % (cohort, reference_name)
+)
+apalyzer_utr_events = os.path.join(
+    events_dir, "%s_%s_apalyzer_3utr_events.tsv" % (cohort, apalyzer_reference_name)
+)
+apalyzer_ipa_events = os.path.join(
+    events_dir, "%s_%s_apalyzer_ipa_events.tsv" % (cohort, apalyzer_reference_name)
+)
+
+
+# Keep QAPA isolated from user Python and R libraries on the cluster.
+qapa_prefix = (
+    "unset PYTHONPATH; export PYTHONNOUSERSITE=1; "
+    "export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1; "
+    "unset R_HOME R_LIBS R_LIBS_USER; "
+    "export R_ENVIRON_USER=/dev/null R_PROFILE_USER=/dev/null; "
+    "export PATH=" + shlex.quote(os.path.join(qapa_env, "bin")) + ":$PATH; "
+)
+
+
+def final_outputs():
+    outputs = []
+    if run_qapa:
+        outputs.append(qapa_events)
+    if run_apalyzer:
+        outputs.extend([apalyzer_utr_events, apalyzer_ipa_events])
+    return outputs
+
+
+rule all:
+    input:
+        final_outputs()
+
+
+# APAlyzer reference --------------------------------------------------------
+rule prepare_apalyzer_reference:
+    input:
+        source = apalyzer_source
+    output:
+        prepared = apalyzer_reference
+    params:
+        script = "scripts/prepare_apalyzer_reference.R",
+        reference_name = apalyzer_reference_name
+    shell:
+        "ml R/4.4.1; "
+        "Rscript {params.script} {input.source:q} {params.reference_name:q} "
+        "{output.prepared:q}"
+
+
+# Per-sample quantification -------------------------------------------------
+rule qapa_salmon_quant:
+    input:
+        index = qapa_index,
+        reads = qapa_read_paths
+    output:
+        quant = qapa_quant_pattern
+    params:
+        output = lambda wildcards: os.path.dirname(
+            qapa_quant_pattern.format(sample=wildcards.sample)
+        ),
+        library_type = salmon_library_type,
+        salmon = salmon
+    threads:
+        threads
+    run:
+        if qapa_input == "fastq":
+            read_1 = input.reads[0]
+            read_2 = input.reads[1]
+            scratch = None
+        else:
+            bam = input.reads[0]
+            scratch_root = os.environ.get("TMPDIR") or "/tmp"
+            scratch = tempfile.mkdtemp(
+                prefix="apa_%s_" % wildcards.sample,
+                dir=scratch_root,
+            )
+            read_1 = os.path.join(scratch, wildcards.sample + "_R1.fastq.gz")
+            read_2 = os.path.join(scratch, wildcards.sample + "_R2.fastq.gz")
+            fastq_threads = max(1, threads // 4)
+            collate_threads = max(1, threads - fastq_threads - 2)
+            shell(
+                "ml samtools/1.17; set -o pipefail; "
+                "samtools collate -@ {collate_threads} -u -O {bam:q} "
+                "{scratch:q}/collated | "
+                "samtools fastq -@ {fastq_threads} -F 0x900 "
+                "-1 {read_1:q} -2 {read_2:q} -0 /dev/null -s /dev/null -n -"
+            )
+
+        try:
+            shell(
+                "{params.salmon:q} quant -i {input.index:q} -p {threads} "
+                "-l {params.library_type:q} -1 {read_1:q} -2 {read_2:q} "
+                "--seqBias --gcBias --posBias --validateMappings "
+                "-o {params.output:q}"
+            )
+        finally:
+            if scratch is not None and os.path.isdir(scratch):
+                shutil.rmtree(scratch)
+
+
+rule apalyzer_count:
+    input:
+        reference = apalyzer_reference,
+        bam = lambda wildcards: input_path(wildcards.sample, "BAM")
+    output:
+        utr = apalyzer_utr_pattern,
+        ipa = apalyzer_ipa_pattern
+    params:
+        script = "scripts/run_apalyzer.R",
+        output = lambda wildcards: os.path.dirname(
+            apalyzer_utr_pattern.format(sample=wildcards.sample)
+        ),
+        strand = apalyzer_strand_type,
+        seq_type = apalyzer_seq_type
+    threads:
+        threads
+    shell:
+        "ml R/4.4.1; "
+        "Rscript {params.script} {input.reference:q} {input.bam:q} "
+        "{wildcards.sample:q} {params.output:q} {params.strand:q} "
+        "{params.seq_type:q} {threads}"
+
+
+# Cohort event tables -------------------------------------------------------
+rule qapa_events:
+    input:
+        identifiers = qapa_identifiers,
+        quants = expand(qapa_quant_pattern, sample=samples)
+    output:
+        events = qapa_events
+    params:
+        qapa = qapa,
+        prefix = qapa_prefix,
+        event_dir = events_dir
+    run:
+        os.makedirs(params.event_dir, exist_ok=True)
+        staging = tempfile.mkdtemp(prefix=".qapa_", dir=params.event_dir)
+        staged_quantifications = []
+
+        for sample, quantification in zip(samples, input.quants):
+            sample_dir = os.path.join(staging, sample)
+            os.makedirs(sample_dir)
+            link = os.path.join(sample_dir, "quant.sf")
+            os.symlink(os.path.abspath(quantification), link)
+            staged_quantifications.append(link)
+
+        arguments = " ".join(
+            shlex.quote(path) for path in staged_quantifications
+        )
+        try:
+            shell(
+                params.prefix
+                + shlex.quote(params.qapa)
+                + " quant --db "
+                + shlex.quote(str(input.identifiers))
+                + " "
+                + arguments
+                + " > "
+                + shlex.quote(str(output.events))
+            )
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+        with open(output.events) as handle:
+            header = handle.readline().rstrip("\n").split("\t")
+            has_rows = bool(handle.readline())
+
+        if "APA_ID" not in header or not has_rows:
+            raise WorkflowError("QAPA produced no APA events")
+        missing_samples = [
+            sample for sample in samples if sample + ".PAU" not in header
+        ]
+        if missing_samples:
+            raise WorkflowError(
+                "QAPA output is missing PAU columns for: %s"
+                % ", ".join(missing_samples[:5])
+            )
+
+
+rule collect_apalyzer_events:
+    input:
+        utr = expand(apalyzer_utr_pattern, sample=samples),
+        ipa = expand(apalyzer_ipa_pattern, sample=samples)
+    output:
+        utr = apalyzer_utr_events,
+        ipa = apalyzer_ipa_events
+    params:
+        script = "scripts/collect_apalyzer_events.R"
+    shell:
+        "ml R/4.4.1; "
+        "Rscript {params.script} {output.utr:q} {output.ipa:q} "
+        "{input.utr:q} --ipa {input.ipa:q}"

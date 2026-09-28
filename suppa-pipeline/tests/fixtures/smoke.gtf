@@ -1,0 +1,5 @@
+chr1	test	exon	100	199	.	+	.	gene_id "g1"; transcript_id "t1";
+chr1	test	exon	300	399	.	+	.	gene_id "g1"; transcript_id "t1";
+chr1	test	exon	500	599	.	+	.	gene_id "g1"; transcript_id "t1";
+chr1	test	exon	100	199	.	+	.	gene_id "g1"; transcript_id "t2";
+chr1	test	exon	500	599	.	+	.	gene_id "g1"; transcript_id "t2";

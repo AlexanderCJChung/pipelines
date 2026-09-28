@@ -1,0 +1,36 @@
+# LSF resources. Memory is per core on Minerva.
+
+__default__:
+  queue: express
+  cores: 1
+  mem: 3750
+  time: '180'
+  name: $(basename $(pwd)):{rule}:{wildcards}
+  output: logs/{rule}:{wildcards}.stdout
+  error: logs/{rule}:{wildcards}.stderr
+  himem: ''
+
+prepare_apalyzer_reference:
+  time: '480'
+  cores: 4
+  mem: 16000  # PAS2GEF on a 1.4 GB GTF needs ~40 GB
+
+qapa_salmon_quant:
+  time: '720'
+  cores: 16
+  mem: 12000
+
+apalyzer_count:
+  time: '360'
+  cores: 16
+  mem: 8000
+
+qapa_events:
+  time: '480'
+  cores: 4
+  mem: 16000
+
+collect_apalyzer_events:
+  time: '480'
+  cores: 4
+  mem: 16000

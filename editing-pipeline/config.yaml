@@ -1,0 +1,67 @@
+# Rationale for every threshold is in docs/EDITING_DATA_METHODS.md.
+sample_manifest: /sc/arion/projects/pd-omics/MiGA_isomiga_v38_annotation/sample_manifest.tsv
+release_root: /sc/arion/projects/pd-omics/MiGA_isomiga_v38_annotation/editing/2026-09-28_editing_jacusa2.0.1
+
+# References
+genome_fasta: /sc/arion/projects/ad-omics/data/references/GRCh38_references/GRCh38.primary_assembly.genome.fa
+blacklist_bed: /sc/arion/projects/ad-omics/data/references/editing/hg38-blacklist.v2_sort.bed
+redi_sites_bed: /sc/arion/projects/ad-omics/data/references/editing/REDIsites.bed
+humandb: /sc/arion/projects/ad-omics/data/references/editing/annovar_humandb/
+gencode_gene_strand: /sc/arion/projects/ad-omics/data/references/hg38_reference/GENCODE/gencode.v38.primary_assembly/gencode.v38.primary_assembly.gene_strand.tsv.gz
+aei_ref_dir: /sc/arion/projects/ad-omics/data/software/RNAEditingIndexer/Resources
+# One operation letter and one -arg field per protocol. gnomad30_genome costs ~1 h.
+annovar_protocols: refGene,dbsnp153CommonSNV,gnomad30_genome,phastConsElements30way,rmsk,rediportal_012920
+annovar_operations: g,f,f,r,r,f
+annovar_args: "'--neargene 10000',,,,,"
+
+chroms: [chr1, chr2, chr3, chr4, chr5, chr6, chr7, chr8, chr9, chr10, chr11, chr12,
+         chr13, chr14, chr15, chr16, chr17, chr18, chr19, chr20, chr21, chr22, chrX, chrY]
+
+tools:
+  run_jacusa: true
+  run_aei: true
+  run_reditools: false   # exploratory; see the methods doc before enabling
+
+# Library (MiGA: unstranded, paired-end)
+library: UNSTRANDED      # JACUSA -P: UNSTRANDED | FR-SECONDSTRAND | RF-FIRSTSTRAND
+paired: true             # AEI --paired
+
+# JACUSA calling
+jacusa_module: jacusa2/2.0.1
+min_mapq: 20             # STAR unique alignments only
+min_basq: 20
+flag_filter: 3844        # unmapped + QC-fail + duplicate + secondary + supplementary
+denovo_site_depth: 10
+known_site_depth: 5
+alt_depth: 3
+min_edit_rate_site: 0.01
+multiallelic: drop       # drop | top
+
+# Cohort filter (one cohort-wide group)
+merge_min_samples: 2
+min_coverage: 40         # site detected in >= this many samples
+min_edit_rate: 0.01      # and mean editing rate >= this
+max_gnomad_af: 0         # 0 = absent from gnomAD
+
+# Pileup back-fill
+pileup_min_cov: 5        # below this a cell is NA; at or above, 0 alt reads is a true zero
+site_missingness: 0.75   # keep sites covered in >= this share of samples
+sample_missingness: 0.5  # then samples covered at >= this share of sites
+
+# AEI
+aei_contig: chr1
+
+# Release check: gene-oriented A>G share of final sites
+min_ag_fraction: 0.8
+
+r_module: R/4.4.1
+
+# REDItools
+reditools_dir: /hpc/packages/minerva-centos7/reditools/2.0/reditools2.0
+reditools_ref: /sc/arion/projects/ad-omics/data/references/hg38_reference/hg38.fa
+reditools_fai: /sc/arion/projects/ad-omics/data/references/hg38_reference/hg38.standard_chr.fa.fai
+reditools_homopolymer: /sc/arion/projects/ad-omics/data/references/editing/homopolymeric_sites_hg38.txt
+reditools_dbsnp_bed: /sc/arion/projects/ad-omics/data/references/hg38_reference/dbSNP/hg38_common_snps_dbSNP_153.bed.gz
+reditools_strand: 0      # 0 = unstranded
+reditools_change_dp: 3
+reditools_locus_dp: 5

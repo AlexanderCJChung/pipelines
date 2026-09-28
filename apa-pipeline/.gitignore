@@ -1,0 +1,8 @@
+.DS_Store
+.Rhistory
+.Rproj.user/
+.Rsubread_UserProvidedAnnotation_*
+.snakemake/
+logs/
+__pycache__/
+*.pyc

@@ -1,0 +1,10 @@
+# 4 MiGA BAMs cut to chr21:33-37 Mb, same thresholds as the 2026-08-04 smoke run.
+# Overrides config.yaml:  ./submit.sh --configfile tests/smoke_config.yaml
+sample_manifest: /sc/arion/projects/pd-omics/alex/pipelines/editing-pipeline/tests/smoke_manifest.tsv
+release_root: /sc/arion/scratch/chunga08/editing_smoke_2026-09-28
+redi_sites_bed: /sc/arion/projects/pd-omics/alex/editing_smoke_tmp/REDIsites.chr21sub.bed
+chroms: [chr21]
+aei_contig: chr21
+min_coverage: 2
+site_missingness: 0.5
+sample_missingness: 0.1

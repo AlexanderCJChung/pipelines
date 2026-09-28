@@ -1,0 +1,17 @@
+# Shared Snakemake 7 profile for Minerva LSF: snakemake --profile <pipelines>/profiles/lsf
+# Rules declare threads, resources (mem_mb, runtime in minutes) and a log: path;
+# the LSF stdout/stderr of each job goes to that log. mem_mb is passed straight to
+# rusage[mem], so keep multi-core rules explicit about whether it is per job or per core.
+cluster: >-
+  bsub -P acc_pd-omics -q {resources.queue} -n {threads}
+  -R "rusage[mem={resources.mem_mb}]" -R "span[hosts=1]" -W {resources.runtime}
+  -J smk:{rule}:{wildcards} -oo {log}
+default-resources:
+  - queue="express"
+  - mem_mb=4000
+  - runtime=60
+jobs: 50
+latency-wait: 90
+keep-going: true
+rerun-incomplete: true
+printshellcmds: true
